@@ -249,8 +249,10 @@ class NervCarpetPrinter {
     this.checkpointAxis = null;
     this.checkpointAxisOffset = null;
     this.lastWalkingProgressAt = Date.now();
+    this.lastWalkingProgressPos = null;
     this.lastPathfinderStallLogAt = 0;
     this.interactRecoveryUntil = 0;
+    this.waterTravelRecoveryUntil = 0;
     this.pathfinderGoalKey = null;
     this.lastUnsneakAt = 0;
     this.lastPacketPrintMoveAt = 0;
@@ -289,6 +291,51 @@ class NervCarpetPrinter {
       'WaterBucketRecover',
       'WaterDrainBlocked'
     ].includes(this.state);
+  }
+
+  isWaterTravelCheckpointAction(action) {
+    return action === 'waterBucketPickup' || action === 'waterBucketStore';
+  }
+
+  isWaterTravelPhase() {
+    return this.state === 'Walking' && this.isWaterTravelCheckpointAction(this.checkpoints[0]?.action);
+  }
+
+  isWaterInteractPhase() {
+    return [
+      'AwaitWaterBucketPickup',
+      'AwaitWaterBucketStore',
+      'WaterBucketDrain',
+      'WaterBucketMakeRoom',
+      'WaterBucketRecover'
+    ].includes(this.state);
+  }
+
+  waterMotionPhase() {
+    if (this.isWaterTravelPhase()) return 'travel';
+    if (this.isWaterInteractPhase()) return 'interact';
+    return 'idle';
+  }
+
+  shouldSuppressAntiVelocityDuringWaterTravel() {
+    return this.isWaterTravelPhase();
+  }
+
+  noteWalkingProgress() {
+    const pos = this.bot.entity?.position;
+    if (!pos) return;
+    if (!this.lastWalkingProgressPos) {
+      this.lastWalkingProgressPos = { x: pos.x, y: pos.y, z: pos.z };
+      return;
+    }
+    const dx = pos.x - this.lastWalkingProgressPos.x;
+    const dy = pos.y - this.lastWalkingProgressPos.y;
+    const dz = pos.z - this.lastWalkingProgressPos.z;
+    const movement = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (movement >= 0.12) {
+      this.lastWalkingProgressAt = Date.now();
+      this.lastWalkingProgressPos = { x: pos.x, y: pos.y, z: pos.z };
+    }
   }
 
   zeroVelocityForResetWater() {
@@ -381,7 +428,9 @@ class NervCarpetPrinter {
       `pending=${this.pendingPlacements.size}(air=${pending.air},solid=${pending.solid},due=${pending.due}) ` +
       `optimistic=${this.optimisticPlacements.size} ` +
       `refs=${this.placementReferenceStats.side}/${this.placementReferenceStats.below}/${this.placementReferenceStats.clickableBelow} ` +
-      `sneak=${this.placementReferenceStats.packetSneak}/${this.placementReferenceStats.controlSneak}`
+      `sneak=${this.placementReferenceStats.packetSneak}/${this.placementReferenceStats.controlSneak} ` +
+      `water=${this.waterMotionPhase()} antiVelTravel=${this.shouldSuppressAntiVelocityDuringWaterTravel() ? 'yes' : 'no'} ` +
+      `move=${this.pathfinderGoalKey ? 'pathfinder' : (this.packetPrintMovementActive ? 'packet' : 'walk')}`
     );
   }
 
@@ -539,12 +588,14 @@ class NervCarpetPrinter {
     if (this.findDrainableWaterSources(1).length > 0) return false;
     this.waterResumeState = null;
     this.waterDrainCurrent = null;
+    this.waterTravelRecoveryUntil = 0;
     this.checkpoints = this.cloneCheckpointQueue(snapshot.checkpoints);
     this.checkpointKey = null;
     this.checkpointBestDistance = Number.POSITIVE_INFINITY;
     this.checkpointAxis = null;
     this.checkpointAxisOffset = null;
     this.lastWalkingProgressAt = Date.now();
+    this.lastWalkingProgressPos = null;
     this.timeoutTicks = ticksFromMs(this.settings.waterDrainActionDelayMs ?? 500);
     this.state = this.checkpoints.length > 0 ? 'Walking' : (snapshot.state || 'Idle');
     this.info(
@@ -559,12 +610,14 @@ class NervCarpetPrinter {
     if (!snapshot) return false;
     this.waterResumeState = null;
     this.waterDrainCurrent = null;
+    this.waterTravelRecoveryUntil = 0;
     this.checkpoints = this.cloneCheckpointQueue(snapshot.checkpoints);
     this.checkpointKey = null;
     this.checkpointBestDistance = Number.POSITIVE_INFINITY;
     this.checkpointAxis = null;
     this.checkpointAxisOffset = null;
     this.lastWalkingProgressAt = Date.now();
+    this.lastWalkingProgressPos = null;
     this.timeoutTicks = ticksFromMs(this.settings.waterDrainActionDelayMs ?? 500);
     this.state = this.checkpoints.length > 0 ? 'Walking' : (snapshot.state || 'Idle');
     this.info(
@@ -1785,33 +1838,46 @@ class NervCarpetPrinter {
     this.ensureUnsneakingWhileWalking();
     const canUsePathfinder = Boolean(this.bot.pathfinder?.setGoal && goals?.GoalNear);
     const forcedInteractPath = forcePathfinder && canUsePathfinder && !this.isPrintCheckpointAction(action);
+    const waterTravel = this.isWaterTravelCheckpointAction(action);
     const now = Date.now();
     const stalledInteractPath =
       !forcePathfinder &&
       this.shouldUsePathfinder(action) &&
       now - this.lastWalkingProgressAt > (this.settings.walkingStallMs ?? 15000);
     if (stalledInteractPath) {
-      this.interactRecoveryUntil = now + Math.max(TICK_MS, this.settings.interactRecoveryMs ?? 3000);
+      const recoveryUntil = now + Math.max(TICK_MS, this.settings.interactRecoveryMs ?? 3000);
+      if (waterTravel) {
+        this.waterTravelRecoveryUntil = recoveryUntil;
+        this.interactRecoveryUntil = 0;
+      } else {
+        this.interactRecoveryUntil = recoveryUntil;
+      }
       if (this.pathfinderGoalKey) {
         this.bot.pathfinder?.setGoal?.(null);
         this.pathfinderGoalKey = null;
       }
       if (now - this.lastPathfinderStallLogAt > (this.settings.progressLogMs ?? 30000)) {
         this.lastPathfinderStallLogAt = now;
-        this.warn(`Pathfinder stalled for ${action}; packet walking to recover.`);
+        this.warn(`Pathfinder stalled for ${action}; packet walking to recover (waterPhase=${this.waterMotionPhase()}).`);
       }
     }
-    if (!forcePathfinder && this.shouldUsePathfinder(action) && this.interactRecoveryUntil > now) {
+    if (
+      !forcePathfinder &&
+      this.shouldUsePathfinder(action) &&
+      (this.interactRecoveryUntil > now || this.waterTravelRecoveryUntil > now)
+    ) {
       if (this.pathfinderGoalKey) {
         this.bot.pathfinder?.setGoal?.(null);
         this.pathfinderGoalKey = null;
       }
       if (this.bot._client?.write) {
+        if (waterTravel) this.info(`Water travel recovery active for ${action}; packet walking to repath.`);
         this.packetPrintStepToward(goal);
         return;
       }
     } else if (this.shouldUsePathfinder(action) || forcedInteractPath) {
       this.restorePhysicsAfterPacketPrint();
+      if (waterTravel) this.waterTravelRecoveryUntil = 0;
       const buffer = forcedInteractPath
         ? Math.max(this.checkpointBuffer({ goal, action }), 0.8)
         : this.checkpointBuffer({ goal, action });
@@ -1823,7 +1889,7 @@ class NervCarpetPrinter {
       if (key !== this.pathfinderGoalKey) {
         this.pathfinderGoalKey = key;
         this.info(
-          `Pathing to ${forcedInteractPath ? 'recover' : action} ` +
+          `Pathing to ${forcedInteractPath ? 'recover' : action}${waterTravel ? ' (water travel)' : ''} ` +
           `(${goal.x.toFixed(2)},${goal.y.toFixed(2)},${goal.z.toFixed(2)})`
         );
         this.bot.pathfinder.setGoal(new goals.GoalNear(goal.x, goal.y, goal.z, buffer));
@@ -1834,6 +1900,7 @@ class NervCarpetPrinter {
       this.bot.pathfinder?.setGoal?.(null);
       this.pathfinderGoalKey = null;
     }
+    if (waterTravel) this.waterTravelRecoveryUntil = 0;
     if (this.shouldUsePacketPrintMovement(action)) {
       this.packetPrintStepToward(goal);
       return;
@@ -2297,6 +2364,7 @@ class NervCarpetPrinter {
       this.state = 'AwaitAreaClear';
       return;
     }
+    this.waterTravelRecoveryUntil = 0;
 
     const sourceBlock = this.blockAt(current.source);
     const hasWater = this.isWaterSourceBlock(sourceBlock);
@@ -2363,6 +2431,7 @@ class NervCarpetPrinter {
       this.state = 'AwaitAreaClear';
       return;
     }
+    this.waterTravelRecoveryUntil = 0;
 
     const carriedWaterBucket = this.inventoryBucket(false);
     if (!carriedWaterBucket) {
@@ -2637,6 +2706,7 @@ class NervCarpetPrinter {
       this.state = 'AwaitAreaClear';
       return;
     }
+    this.waterTravelRecoveryUntil = 0;
     const dump = this.randomCarpetStack();
     if (!dump) {
       this.warn(`Water drain blocked: no free inventory slot and no carpet stack to toss at ${posKey(current.source)}.`);
@@ -3837,6 +3907,7 @@ class NervCarpetPrinter {
           access: checkpoint.access || 'top',
           bucketReady: Boolean(checkpoint.bucketReady)
         };
+        this.waterTravelRecoveryUntil = 0;
         if (this.inventoryBucket(false) && !this.inventoryBucket(true)) {
           await this.discardWaterBucket('stale carried bucket before pickup');
         }
@@ -3888,6 +3959,7 @@ class NervCarpetPrinter {
           access: checkpoint.access || 'top',
           bucketReady: Boolean(checkpoint.bucketReady)
         };
+        this.waterTravelRecoveryUntil = 0;
         this.state = 'WaterBucketMakeRoom';
         this.stopMovement();
         await this.tickWaterBucketMakeRoom();
@@ -3902,6 +3974,7 @@ class NervCarpetPrinter {
           }),
           access: checkpoint.access || 'top'
         };
+        this.waterTravelRecoveryUntil = 0;
         this.interactRetryCount = 0;
         this.state = 'AwaitWaterBucketStore';
         this.setWaterDrainSneak(false, 'store open');
@@ -4102,6 +4175,7 @@ class NervCarpetPrinter {
   async tickWithCaches() {
     this.logStateChange();
     this.logProgress();
+    this.noteWalkingProgress();
     this.zeroVelocityForResetWater();
     const allowedPlacements = this.allowedPlacements();
 

@@ -146,7 +146,7 @@ test('tryPlacingBlock confirms placement immediately when server update arrives'
   const config = fakeConfig();
   config.printer.placementRetries = 2;
   config.printer.placementVerifyMs = 0;
-  const printer = new NervCarpetPrinter(bot, config, {
+  const printer = new NervCarpetPrinter(bot, fakeConfig(), {
     map: { width: 128, depth: 128, cells },
     mapFile: '/tmp/map.nbt',
     nervFolder: '/tmp'
@@ -195,7 +195,7 @@ test('tryPlacingBlock queues unconfirmed holes for fast retry without blocking',
   config.printer.placementVerifyMs = 0;
   config.printer.placementRetryDelayMs = 1;
   config.printer.placementPendingMs = 10;
-  const printer = new NervCarpetPrinter(bot, config, {
+  const printer = new NervCarpetPrinter(bot, fakeConfig(), {
     map: { width: 128, depth: 128, cells },
     mapFile: '/tmp/map.nbt',
     nervFolder: '/tmp'
@@ -225,7 +225,7 @@ test('findClosestPlacement prioritizes due pending holes before new cells', () =
   config.printer.minPlaceDistance = 0.1;
   config.printer.placementRetries = 12;
   config.printer.placementRetries = 12;
-  const printer = new NervCarpetPrinter(bot, config, {
+  const printer = new NervCarpetPrinter(bot, fakeConfig(), {
     map: { width: 128, depth: 128, cells },
     mapFile: '/tmp/map.nbt',
     nervFolder: '/tmp'
@@ -1815,6 +1815,51 @@ test('last water source cleanup restores print queue instead of parking in Await
   assert.equal(printer.state, 'Walking');
   assert.equal(printer.waterResumeState, null);
   assert.deepEqual(printer.checkpoints.map((checkpoint) => checkpoint.action), ['sprint', 'lineEnd']);
+});
+
+test('water travel phase marks anti-velocity as suppressed', () => {
+  const printer = new NervCarpetPrinter(fakeBot(), fakeConfig(), {
+    map: { width: 128, depth: 128, cells: emptyCells() },
+    mapFile: '/tmp/map.nbt',
+    nervFolder: '/tmp'
+  });
+  printer.state = 'Walking';
+  printer.checkpoints = [{ goal: { x: 0.5, y: 108, z: 10.5 }, action: 'waterBucketPickup' }];
+
+  assert.equal(printer.waterMotionPhase(), 'travel');
+  assert.equal(printer.shouldSuppressAntiVelocityDuringWaterTravel(), true);
+});
+
+test('water travel stall clears pathfinder goal and packet-walks to recover', () => {
+  const bot = fakeBot();
+  const setGoals = [];
+  const writes = [];
+  bot.pathfinder = {
+    setGoal: (goal) => setGoals.push(goal),
+    movements: {}
+  };
+  bot._client = { write: (name, packet) => writes.push([name, packet]) };
+  bot.entity.position = new Vec3(0.5, 108, 0.5);
+  const config = fakeConfig();
+  config.printer.pathfinderForInteractTravel = true;
+  const printer = new NervCarpetPrinter(bot, config, {
+    map: { width: 128, depth: 128, cells: emptyCells() },
+    mapFile: '/tmp/map.nbt',
+    nervFolder: '/tmp'
+  });
+  printer.state = 'Walking';
+  printer.checkpoints = [{ goal: { x: 0.5, y: 108, z: 10.5 }, action: 'waterBucketPickup' }];
+  printer.pathfinderGoalKey = 'waterBucketPickup:0.50,108.00,10.50:0.80';
+  printer.lastWalkingProgressAt = Date.now() - 20000;
+  printer.lastPathfinderStallLogAt = 0;
+
+  printer.steerToward({ x: 0.5, y: 108, z: 10.5 }, 'waterBucketPickup', false);
+
+  assert.equal(printer.waterTravelRecoveryUntil > Date.now(), true);
+  assert.equal(printer.interactRecoveryUntil, 0);
+  assert.equal(printer.pathfinderGoalKey, null);
+  assert.equal(setGoals.some((goal) => goal === null), true);
+  assert.equal(writes.some(([name]) => name === 'position_look'), true);
 });
 
 test('anti velocity tick guard zeros velocity during reset-water states', async () => {

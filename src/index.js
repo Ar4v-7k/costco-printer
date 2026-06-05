@@ -326,26 +326,34 @@ function wireRuntimeGuards(bot, printer, config, requestEnd) {
   if (config.printer.antiVelocity !== false) {
     console.log('[guard] Anti-velocity enabled.');
     if (config.printer.antiVelocityLiquid !== false) console.log('[guard] Anti-velocity liquid mode enabled.');
+    const shouldSuppressAntiVelocity = () => printer.shouldSuppressAntiVelocityDuringWaterTravel?.();
     if (bot._client && !bot._client.__nervAntiVelocityPatched) {
       const rawEmit = bot._client.emit.bind(bot._client);
       bot._client.emit = (eventName, packet, ...args) => {
-        if (eventName === 'entity_velocity') {
-          const id = packet?.entityId ?? packet?.entityID;
-          if (id === bot.entity?.id && packet?.velocity) {
-            packet.velocity.x = 0;
-            packet.velocity.y = 0;
-            packet.velocity.z = 0;
+        if (!shouldSuppressAntiVelocity()) {
+          if (eventName === 'entity_velocity') {
+            const id = packet?.entityId ?? packet?.entityID;
+            if (id === bot.entity?.id && packet?.velocity) {
+              packet.velocity.x = 0;
+              packet.velocity.y = 0;
+              packet.velocity.z = 0;
+            }
+          } else if (eventName === 'explosion' && packet) {
+            if (packet.playerKnockback) {
+              packet.playerKnockback.x = 0;
+              packet.playerKnockback.y = 0;
+              packet.playerKnockback.z = 0;
+            }
+            if ('playerMotionX' in packet) {
+              packet.playerMotionX = 0;
+              packet.playerMotionY = 0;
+              packet.playerMotionZ = 0;
+            }
           }
-        } else if (eventName === 'explosion' && packet) {
-          if (packet.playerKnockback) {
-            packet.playerKnockback.x = 0;
-            packet.playerKnockback.y = 0;
-            packet.playerKnockback.z = 0;
-          }
-          if ('playerMotionX' in packet) {
-            packet.playerMotionX = 0;
-            packet.playerMotionY = 0;
-            packet.playerMotionZ = 0;
+        } else if (eventName === 'entity_velocity' || eventName === 'explosion') {
+          const phase = printer.waterMotionPhase?.() || 'unknown';
+          if (phase === 'travel') {
+            console.log(`[guard] antiVelocity travel suppression active for ${eventName}.`);
           }
         }
         return rawEmit(eventName, packet, ...args);
@@ -354,6 +362,7 @@ function wireRuntimeGuards(bot, printer, config, requestEnd) {
       console.log('[guard] Anti-velocity packet patch active.');
     }
     const zeroVelocity = (source = 'unknown') => {
+      if (printer.shouldSuppressAntiVelocityDuringWaterTravel?.()) return;
       if (!bot.entity?.velocity?.set) return;
       bot.entity.velocity.set(0, 0, 0);
       printer.zeroVelocityForResetWater?.();
